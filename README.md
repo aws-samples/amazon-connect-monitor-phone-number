@@ -1,11 +1,6 @@
-## My Project
+## Monitor the health of phone numbers in Amazon Connect
 
-TODO: Fill this README out!
-
-Be sure to:
-
-* Change the title in this README
-* Edit your repository description on GitHub
+Cloudformation template to craete an AWS Lambda to send SMS message if the scheduled EventBridge event could not detect a healthy phone number
 
 ## Security
 
