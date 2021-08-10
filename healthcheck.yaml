@@ -1,0 +1,176 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: 'PhoneHealthCheck: Create Lambda that updates call and check the reachability of a phone number'
+Parameters:
+    AmazonConnectInstanceID:
+        Type: String
+        Description: What is the instance ID for your Amazon Connect Instance?
+        Default: "86d4458a-77de-4ef8-bb59-5712c9bf012e"
+    PHCRuleName:
+        Type: String
+        Description: Event Bridge rule name?
+        Default: PhoneHealthCheck-Rule
+    RuleCronExpression:
+        Type: String
+        Description: Event Bridge rule cron expression
+        Default: "cron(0 15 * * ? *)"
+    ContactFlowID:
+        Type: String
+        Description: The Oubound Contact Flow ID
+        Default: "86d4458a-77de-4ef8-bb59-5712c9bf012e"
+    DestinationNumber:
+        Type: String
+        Description: The phone number to check fo reachability
+        Default: "+12223334444"
+    PageNumber:
+        Type: String
+        Description: Mobile phone number to send SMS about the status
+        Default: "+12223334444"
+    SourceNumber:
+        Type: String
+        Description: The phone number you claimed to make the outbound call ANI
+        Default: "+12223334444"
+    SuccessCode:
+        Type: String
+        Description: The DTMF code you generated that you will playback as a prompt
+        Default: "31642"
+Resources:
+  #####################################################
+  # IAM Role
+  #####################################################
+    IAMRolePHC:
+        Type: AWS::IAM::Role
+        DeletionPolicy: Delete
+        Properties:
+          AssumeRolePolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+            - Effect: Allow
+              Principal:
+                Service:
+                - lambda.amazonaws.com
+              Action:
+              - sts:AssumeRole
+          Policies:
+          - PolicyName: Policy_PHC_CloudwatchLogs
+            PolicyDocument:
+              Version: '2012-10-17'
+              Statement:
+              - Effect: Allow
+                Action:
+                - logs:CreateLogGroup
+                - logs:CreateLogStream
+                - logs:PutLogEvents
+                Resource: arn:aws:cloudwatch:*:*:*
+          - PolicyName: Policy_PHC_AmazonConnect
+            PolicyDocument:
+              Version: '2012-10-17'
+              Statement:
+              - Effect: Allow
+                Action:
+                - connect:GetContactAttributes
+                - connect:StartOutboundVoiceContact
+                - sns:Publish
+                Resource: "*"
+          RoleName: IAMRole_PHC
+  #########################################################
+  # Lambda function
+  #########################################################
+    LambdaPHC: ## Logical CFT ID
+        Type: AWS::Lambda::Function
+        DeletionPolicy: Delete
+        Properties:
+          Handler: index.lambda_handler
+          Runtime: python3.8
+          FunctionName: PhoneHealthCheck
+          Code:
+            ZipFile: |
+                import json
+                import boto3
+                import os
+                import time
+                
+                client = boto3.client('connect')
+                
+                def outboundTest(DestinationPhoneNumber, ContactFlowId, InstanceId, SourcePhoneNumber):
+
+                    response = client.start_outbound_voice_contact(
+                        DestinationPhoneNumber = DestinationPhoneNumber,
+                        ContactFlowId = ContactFlowId,
+                        InstanceId = InstanceId,
+                        SourcePhoneNumber = SourcePhoneNumber,
+                        Attributes={
+                            'collectedDigits': '00000'
+                        }
+                    )
+                    time.sleep(10)
+
+                    contactAttribute =  client.get_contact_attributes(
+                        InstanceId = InstanceId,
+                        InitialContactId = response["ContactId"]
+                    )
+
+                    mesgcode = contactAttribute["Attributes"]["collectedDigits"]
+
+                    return mesgcode
+                
+                def lambda_handler(event, context):
+                
+                    DestinationPhoneNumber  = event["DEST_NUMBER"]
+                    ContactFlowId           = event["CF_ID"]
+                    InstanceId              = event['INSTANCE_ID']
+                    SourcePhoneNumber       = event['SOURCE_NUMBER']
+                    SuccessCode             = event['SUCCESS_CODE']
+                    PageNumber              = event['PAGE_NUMBER']
+                
+                    mesgcode = outboundTest(DestinationPhoneNumber, ContactFlowId, InstanceId, SourcePhoneNumber)
+                    
+                    if mesgcode == '00000':
+                        mesgcode = outboundTest(DestinationPhoneNumber, ContactFlowId, InstanceId, SourcePhoneNumber)
+                    
+                    if mesgcode == SuccessCode:
+                        mesg = 'SUCCESS'
+                    else:
+                        mesg = 'FAILED'
+                
+                    mesg = "Phone number " + DestinationPhoneNumber + " test result: " + mesg
+                
+                    SNSclient = boto3.client("sns")
+                    
+                    SNSclient.publish(
+                        PhoneNumber=PageNumber,
+                        Message=mesg
+                    )
+                
+                    return {
+                        'status': mesg,
+                        'retCode': mesgcode
+                    }
+          MemorySize: 1024
+          Timeout: 360
+          Role: !GetAtt IAMRolePHC.Arn
+  #########################################################
+  # Create the Event Bridge
+  #########################################################
+    PHCEVENTBRIDGE:
+        Type: AWS::Events::Rule
+        Properties: 
+          Description: Contact Event Stream Event 
+          ScheduleExpression:
+            Ref: RuleCronExpression
+          Name: 
+            Ref: PHCRuleName
+          Targets: [ {
+                Id: PHCEVENTBRIDGE,
+                Arn: !GetAtt LambdaPHC.Arn,
+                Input: !Sub "{\"INSTANCE_ID\":\"${AmazonConnectInstanceID}\",\"CF_ID\":\"${ContactFlowID}\",\"DEST_NUMBER\":\"${DestinationNumber}\",\"PAGE_NUMBER\":\"${PageNumber}\",\"SOURCE_NUMBER\":\"${SourceNumber}\",\"SUCCESS_CODE\":\"${SuccessCode}\"}"
+            } ]
+  #########################################################
+  # Lambda resource based policy
+  #########################################################
+    LambdaResourcePolicy:
+      Type: AWS::Lambda::Permission
+      Properties:
+        FunctionName: !GetAtt LambdaPHC.Arn
+        Action: lambda:InvokeFunction
+        Principal: events.amazonaws.com
+        SourceArn: !GetAtt PHCEVENTBRIDGE.Arn
